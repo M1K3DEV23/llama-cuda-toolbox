@@ -1,0 +1,591 @@
+#!/usr/bin/env bash
+# llama-cuda — compilar, instalar y desinstalar llama.cpp con CUDA (Podman + imagen NVIDIA)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=config
+source "${SCRIPT_DIR}/config"
+
+EFFECTIVE_CUDA_TAG="${CUDA_IMAGE_TAG}"
+
+# Modo build (set por cmd_build / cmd_update / cmd_rebuild)
+CLEAN_BUILD=0
+CMAKE_RECONFIGURE=0
+SKIP_BUILD=0
+FORCE_GIT=0
+CHECK_ONLY=0
+
+log()  { printf '\033[1;34m[llama-cuda]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Uso: $(basename "$0") <comando> [opciones]
+
+Comandos:
+  build [--profile P]     Instala/compila (omite si ya está al día)
+  update [--profile P]    Fetch git + recompila solo si hay commits o config nuevos
+  rebuild [--profile P]   Limpia build/ y recompila todo
+  uninstall [--purge]     Desinstala (purge = fuentes + imágenes)
+  clean                   Borra solo ${BUILD_DIR}
+  status                  Estado, git, último commit compilado
+  pull                    Descarga imagen Podman
+  env                     Variables PATH/LD_LIBRARY_PATH
+
+Opciones (build / update / rebuild):
+  --profile, -p PERFIL    stable | latest | toolkit-13.0 | toolkit-12.8
+  --force                 Ignora caché: reset git duro + rebuild completo
+  --check                 Solo informa si hay actualización (no compila)
+  --branch, -b RAMA       Rama git (default: ${GIT_BRANCH} en config)
+
+Git inteligente (update):
+  - fetch de origin/${GIT_BRANCH}
+  - si no hay commits nuevos y cmake igual → no recompila
+  - si solo cambió código → build incremental (sin borrar build/)
+  - si cambió CMakeLists o flags → reconfigure cmake
+  - si --force o rebuild → rm -rf build/
+
+Config: ${SCRIPT_DIR}/config
+EOF
+}
+
+resolve_build_profile() {
+  local profile="${1:-${CUDA_BUILD_PROFILE}}"
+  case "${profile}" in
+    stable|latest)
+      EFFECTIVE_CUDA_TAG="${CUDA_IMAGE_TAG}"
+      CUDA_BUILD_PROFILE="${profile}"
+      ;;
+    toolkit-13.0|cuda-13.0|13.0)
+      EFFECTIVE_CUDA_TAG="13.0.0"
+      CUDA_BUILD_PROFILE="toolkit-13.0"
+      ;;
+    toolkit-12.8|12.8)
+      EFFECTIVE_CUDA_TAG="12.8.0"
+      CUDA_BUILD_PROFILE="toolkit-12.8"
+      ;;
+    *) die "Perfil desconocido: ${profile} (stable | latest | toolkit-13.0 | toolkit-12.8)" ;;
+  esac
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile|-p)
+        [[ $# -ge 2 ]] || die "Falta valor para --profile"
+        resolve_build_profile "$2"
+        shift 2
+        ;;
+      --branch|-b)
+        [[ $# -ge 2 ]] || die "Falta valor para --branch"
+        GIT_BRANCH="$2"
+        shift 2
+        ;;
+      --force) FORCE_GIT=1; CLEAN_BUILD=1; CMAKE_RECONFIGURE=1; shift ;;
+      --check) CHECK_ONLY=1; shift ;;
+      *) break ;;
+    esac
+  done
+}
+
+image_name() { echo "docker.io/nvidia/cuda:${EFFECTIVE_CUDA_TAG}-devel-${CUDA_OS}"; }
+
+image_fallback_tags() {
+  case "${CUDA_BUILD_PROFILE}" in
+    toolkit-13.0) echo "13.0.0" ;;
+    toolkit-12.8) echo "12.8.0" ;;
+    *)            echo "13.2.0 13.1.0 13.0.0 12.8.0" ;;
+  esac
+}
+
+ensure_podman() {
+  command -v podman >/dev/null 2>&1 || die "Instala podman: sudo dnf install -y podman"
+  command -v git >/dev/null 2>&1 || die "Instala git"
+}
+
+pull_image() {
+  local image tag
+  for tag in $(image_fallback_tags); do
+    image="docker.io/nvidia/cuda:${tag}-devel-${CUDA_OS}"
+    if podman image exists "${image}" >/dev/null 2>&1; then
+      EFFECTIVE_CUDA_TAG="${tag}"
+      log "Imagen: ${image}"
+      return
+    fi
+    log "Probando pull: ${image}"
+    if podman pull "${image}" 2>/dev/null; then
+      EFFECTIVE_CUDA_TAG="${tag}"
+      log "Imagen lista: ${image}"
+      return
+    fi
+    warn "No disponible: ${tag}"
+  done
+  die "No se pudo obtener imagen CUDA devel"
+}
+
+profile_description() {
+  case "${CUDA_BUILD_PROFILE}" in
+    stable)       echo "stable (${EFFECTIVE_CUDA_TAG} + -Xcicc -O1)" ;;
+    latest)       echo "latest (${EFFECTIVE_CUDA_TAG})" ;;
+    toolkit-13.0) echo "toolkit-13.0 (CUDA 13.0.0 devel, nvcc 13.0)" ;;
+    toolkit-12.8) echo "toolkit-12.8 (12.8.0-devel)" ;;
+  esac
+}
+
+cmake_build_args() {
+  local args=(
+    -DCMAKE_BUILD_TYPE=Release
+    -DGGML_CUDA=ON
+    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH:-120}"
+  )
+  [[ "${GGML_CUDA_GRAPHS}" =~ ^(ON|1|true)$ ]] && args+=(-DGGML_CUDA_GRAPHS=ON)
+  [[ "${GGML_CUDA_FA_ALL_QUANTS}" =~ ^(ON|1|true)$ ]] && args+=(-DGGML_CUDA_FA_ALL_QUANTS=ON)
+  [[ "${GGML_NATIVE}" =~ ^(ON|1|true)$ ]] && args+=(-DGGML_NATIVE=ON)
+  [[ "${LLAMA_OPENSSL}" =~ ^(ON|1|true)$ ]] && args+=(-DLLAMA_OPENSSL=ON)
+  # CPU_NATIVE_FLAGS solo si no usas GGML_NATIVE (evita duplicar -march=native)
+  if [[ ! "${GGML_NATIVE}" =~ ^(ON|1|true)$ ]] && [[ -n "${CPU_NATIVE_FLAGS:-}" ]]; then
+    args+=(-DCMAKE_C_FLAGS="${CPU_NATIVE_FLAGS}" -DCMAKE_CXX_FLAGS="${CPU_NATIVE_FLAGS}")
+  fi
+  case "${CUDA_BUILD_PROFILE}" in
+    stable) args+=(-DCMAKE_CUDA_FLAGS="-Xcicc -O1") ;;
+  esac
+  printf '%s\n' "${args[@]}"
+}
+
+cmake_args_hash() {
+  {
+    cmake_build_args
+    echo "CUDA_TAG=${EFFECTIVE_CUDA_TAG}"
+    echo "PROFILE=${CUDA_BUILD_PROFILE}"
+  } | sha256sum | awk '{print $1}'
+}
+
+write_cmake_args_file() {
+  mkdir -p "${SRC_DIR}"
+  cmake_build_args >"${SRC_DIR}/.llama-cuda-cmake-args"
+}
+
+# Restaura CMakeLists si quedó parcheado en builds viejos del toolbox
+restore_upstream_cuda_cmake() {
+  [[ -d "${SRC_DIR}/.git" ]] || return 0
+  local cmake_cuda="${SRC_DIR}/ggml/src/ggml-cuda/CMakeLists.txt"
+  [[ -f "${cmake_cuda}" ]] || return 0
+  if grep -q 'llama-cuda-toolbox' "${cmake_cuda}" 2>/dev/null; then
+    git -C "${SRC_DIR}" checkout -- ggml/src/ggml-cuda/CMakeLists.txt
+    log "CMake ggml-cuda restaurado (upstream)"
+  fi
+}
+
+# --- Git en el HOST (más fiable que dentro del contenedor) ---
+git_has_remote_branch() {
+  git -C "${SRC_DIR}" rev-parse "${GIT_REMOTE}/${GIT_BRANCH}" >/dev/null 2>&1
+}
+
+git_local_commit() {
+  git -C "${SRC_DIR}" rev-parse HEAD 2>/dev/null || echo ""
+}
+
+git_remote_commit() {
+  git -C "${SRC_DIR}" rev-parse "${GIT_REMOTE}/${GIT_BRANCH}" 2>/dev/null || echo ""
+}
+
+git_short() {
+  local rev="${1:-}"
+  [[ -n "${rev}" ]] && git -C "${SRC_DIR}" rev-parse --short "${rev}" 2>/dev/null || echo "?"
+}
+
+sync_sources() {
+  mkdir -p "${STATE_DIR}"
+
+  if [[ ! -d "${SRC_DIR}/.git" ]]; then
+    if [[ -e "${SRC_DIR}" ]]; then
+      warn "Eliminando ${SRC_DIR} (sin .git válido)..."
+      rm -rf "${SRC_DIR}"
+    fi
+    log "Clonando ${REPO_URL} (rama ${GIT_BRANCH}, depth 1)..."
+    git clone --depth 1 --branch "${GIT_BRANCH}" --single-branch "${REPO_URL}" "${SRC_DIR}" \
+      || die "git clone falló en ${SRC_DIR}"
+    return 0
+  fi
+
+  local dirty
+  dirty="$(git -C "${SRC_DIR}" status --porcelain 2>/dev/null | grep -vE '^.. \.llama-cuda-' || true)"
+  if [[ -n "${dirty}" ]]; then
+    if [[ "${FORCE_GIT}" -eq 1 ]]; then
+      warn "Descartando cambios locales en ${SRC_DIR}"
+      git -C "${SRC_DIR}" reset --hard HEAD
+      git -C "${SRC_DIR}" clean -fd
+    else
+      die "Hay cambios locales en ${SRC_DIR}. Commit/stash o usa --force"
+    fi
+  fi
+
+  log "Fetch ${GIT_REMOTE}/${GIT_BRANCH}..."
+  if ! git -C "${SRC_DIR}" fetch --depth 1 "${GIT_REMOTE}" "${GIT_BRANCH}" 2>/dev/null; then
+    git -C "${SRC_DIR}" fetch "${GIT_REMOTE}" "${GIT_BRANCH}"
+  fi
+
+  local local_rev remote_rev
+  local_rev="$(git_local_commit)"
+  remote_rev="$(git_remote_commit)"
+
+  [[ -n "${remote_rev}" ]] || die "No existe ${GIT_REMOTE}/${GIT_BRANCH}. Prueba otra rama: --branch main"
+
+  if [[ "${local_rev}" == "${remote_rev}" ]]; then
+    log "Fuentes al día: $(git_short "${local_rev}") (${GIT_BRANCH})"
+    return 1
+  fi
+
+  if [[ "${CHECK_ONLY}" -eq 1 ]]; then
+    log "check: hay commits nuevos en remoto"
+    return 0
+  fi
+
+  log "Actualizando: $(git_short "${local_rev}") → $(git_short "${remote_rev}")"
+  if [[ "${FORCE_GIT}" -eq 1 ]]; then
+    git -C "${SRC_DIR}" reset --hard "${remote_rev}"
+  else
+    git -C "${SRC_DIR}" merge --ff-only "${remote_rev}" || \
+      die "Rama divergió (no fast-forward). Usa: ./llama-cuda update --force"
+  fi
+  return 0
+}
+
+sync_sources_clean() {
+  sync_sources || true
+  restore_upstream_cuda_cmake
+}
+
+last_built_commit() {
+  [[ -f "${LAST_BUILD_COMMIT_FILE}" ]] && cat "${LAST_BUILD_COMMIT_FILE}" || echo ""
+}
+
+last_cmake_hash() {
+  [[ -f "${LAST_CMAKE_HASH_FILE}" ]] && cat "${LAST_CMAKE_HASH_FILE}" || echo ""
+}
+
+sources_changed_since_build() {
+  local cur last
+  cur="$(git_local_commit)"
+  last="$(last_built_commit)"
+  [[ -z "${last}" || "${cur}" != "${last}" ]]
+}
+
+cmake_config_changed() {
+  local cur last
+  cur="$(cmake_args_hash)"
+  last="$(last_cmake_hash)"
+  [[ -z "${last}" || "${cur}" != "${last}" ]]
+}
+
+installed_matches_build() {
+  [[ -x "${INSTALL_DIR}/llama-cli" && -x "${BUILD_DIR}/bin/llama-cli" ]] || return 1
+  cmp -s "${INSTALL_DIR}/llama-cli" "${BUILD_DIR}/bin/llama-cli" 2>/dev/null
+}
+
+plan_build() {
+  CLEAN_BUILD=0
+  CMAKE_RECONFIGURE=0
+  SKIP_BUILD=0
+
+  if [[ "${CLEAN_BUILD}" -eq 1 ]]; then
+    return
+  fi
+
+  if [[ ! -d "${BUILD_DIR}" || ! -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
+    CMAKE_RECONFIGURE=1
+    return
+  fi
+
+  if cmake_config_changed; then
+    log "Config CMake cambió → reconfigure"
+    CMAKE_RECONFIGURE=1
+    return
+  fi
+
+  if sources_changed_since_build; then
+    log "Nuevos commits en fuentes → build incremental"
+    return
+  fi
+
+  if ! installed_matches_build; then
+    log "Binarios instalados desactualizados → reinstalar"
+    return
+  fi
+
+  log "Nada que hacer: fuentes, cmake e instalación coinciden"
+  SKIP_BUILD=1
+}
+
+write_build_plan_file() {
+  mkdir -p "${SRC_DIR}"
+  cat >"${SRC_DIR}/.llama-cuda-build-plan" <<EOF
+CLEAN_BUILD=${CLEAN_BUILD}
+CMAKE_RECONFIGURE=${CMAKE_RECONFIGURE}
+EOF
+}
+
+build_in_container() {
+  write_cmake_args_file
+  write_build_plan_file
+
+  log "Flags CMake:"
+  sed 's/^/  /' "${SRC_DIR}/.llama-cuda-cmake-args"
+  log "Plan: clean=${CLEAN_BUILD} reconfigure=${CMAKE_RECONFIGURE}"
+  log "Perfil: $(profile_description)"
+
+  podman run --rm \
+    --device nvidia.com/gpu=all \
+    --security-opt label=disable \
+    -v "${SRC_DIR}:${SRC_DIR}:Z" \
+    -e HOME="${HOME}" \
+    -w "${SRC_DIR}" \
+    "$(image_name)" \
+    bash -euxo pipefail -c "$(cat <<BUILD
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq cmake git build-essential pkg-config libssl-dev
+
+source ${SRC_DIR}/.llama-cuda-build-plan
+
+SRC=${SRC_DIR}
+BUILD=${BUILD_DIR}
+
+nvcc --version
+nvidia-smi
+
+if [[ "\${CLEAN_BUILD}" == "1" ]]; then
+  rm -rf "\${BUILD}"
+fi
+
+mapfile -t CMAKE_ARGS < "\${SRC}/.llama-cuda-cmake-args"
+
+if [[ ! -f "\${BUILD}/CMakeCache.txt" || "\${CMAKE_RECONFIGURE}" == "1" ]]; then
+  cmake -S "\${SRC}" -B "\${BUILD}" "\${CMAKE_ARGS[@]}"
+else
+  echo "[cmake] Reutilizando CMakeCache (build incremental)"
+fi
+
+grep -q 'GGML_CUDA:BOOL=ON' "\${BUILD}/CMakeCache.txt"
+cmake --build "\${BUILD}" --config Release -j"\$(nproc)"
+
+test -x "\${BUILD}/bin/llama-cli"
+ldd "\${BUILD}/bin/llama-cli" | grep -qiE 'cuda|cudart|ggml'
+echo "[ok] \${BUILD}/bin/"
+BUILD
+)"
+
+  # Artefactos del volumen montado pueden quedar como root tras Podman
+  if [[ -d "${BUILD_DIR}" ]]; then
+    if ! touch "${BUILD_DIR}/.llama-cuda-write-test" 2>/dev/null; then
+      warn "Corrigiendo dueño de ${BUILD_DIR} (root → $(id -un))"
+      sudo chown -R "$(id -u):$(id -g)" "${BUILD_DIR}"
+    else
+      rm -f "${BUILD_DIR}/.llama-cuda-write-test"
+    fi
+  fi
+}
+
+record_build_state() {
+  mkdir -p "${STATE_DIR}"
+  git_local_commit >"${LAST_BUILD_COMMIT_FILE}"
+  cmake_args_hash >"${LAST_CMAKE_HASH_FILE}"
+}
+
+install_bins_and_libs() {
+  log "Instalando en el host..."
+  mkdir -p "${INSTALL_DIR}" "${LIB_DIR}"
+
+  shopt -s nullglob
+  local bins=( "${BUILD_DIR}"/bin/llama-* )
+  ((${#bins[@]})) || die "No hay binarios en ${BUILD_DIR}/bin/"
+
+  cp -af "${bins[@]}" "${INSTALL_DIR}/"
+  chmod +x "${INSTALL_DIR}"/llama-*
+
+  cp -af "${BUILD_DIR}"/bin/libggml*.so* "${LIB_DIR}/" 2>/dev/null || true
+  # CUDA toolkit + NCCL (ggml-cuda enlaza NCCL si GGML_CUDA_NCCL=ON en el build)
+  podman run --rm --security-opt label=disable \
+    -v "${LIB_DIR}:${LIB_DIR}:Z" \
+    "$(image_name)" \
+    bash -c 'set -e
+      cp -a /usr/local/cuda/lib64/libcudart.so* /usr/local/cuda/lib64/libcublas.so* /usr/local/cuda/lib64/libcublasLt.so* '"${LIB_DIR}"'/ 2>/dev/null || true
+      if compgen -G /usr/lib/x86_64-linux-gnu/libnccl.so* >/dev/null; then
+        cp -a /usr/lib/x86_64-linux-gnu/libnccl.so* '"${LIB_DIR}"'/'
+      fi'
+  if ! compgen -G "${LIB_DIR}/libnccl.so*" >/dev/null && ldd "${LIB_DIR}/libggml-cuda.so.0" 2>/dev/null | grep -q 'libnccl.so.*not found'; then
+    warn "libnccl no copiada; llama-cli fallará hasta reinstalar libs"
+  fi
+
+  echo "${EFFECTIVE_CUDA_TAG}" > "${LIB_DIR}/.cuda-tag"
+  echo "${CUDA_BUILD_PROFILE}" > "${LIB_DIR}/.cuda-profile"
+  setup_bashrc
+  record_build_state
+  log "Binarios → ${INSTALL_DIR}"
+}
+
+bashrc_configured() {
+  [[ -f "${HOME}/.bashrc" ]] && grep -qF "${BASHRC_MARKER}" "${HOME}/.bashrc"
+}
+
+setup_bashrc() {
+  bashrc_configured && return
+  cat >>"${HOME}/.bashrc" <<EOF
+
+${BASHRC_MARKER}
+export PATH="${INSTALL_DIR}:\${PATH}"
+export LD_LIBRARY_PATH="${LIB_DIR}:\${LD_LIBRARY_PATH:-}"
+EOF
+  log "Añadido PATH/LD_LIBRARY_PATH a ~/.bashrc"
+}
+
+remove_bashrc_block() {
+  [[ -f "${HOME}/.bashrc" ]] || return
+  for marker in "${BASHRC_MARKER}" "# llama.cpp CUDA (build-llama-cuda-podman.sh)"; do
+    if grep -qF "${marker}" "${HOME}/.bashrc" 2>/dev/null; then
+      sed -i "\|$(printf '%s' "${marker}" | sed 's/[][\\^$.|*+?(){}]/\\&/g')|,/+2d" "${HOME}/.bashrc" || true
+    fi
+  done
+}
+
+run_pipeline() {
+  local git_updated=1
+  if sync_sources_clean; then
+    git_updated=0
+  fi
+
+  if [[ "${CHECK_ONLY}" -eq 1 ]]; then
+    if [[ "${git_updated}" -eq 0 ]] || cmake_config_changed || ! installed_matches_build; then
+      log "check: hay actualización pendiente (git, cmake o instalación)"
+      exit 2
+    fi
+    log "check: al día ($(git_short "$(git_local_commit)"))"
+    exit 0
+  fi
+
+  ensure_podman
+  pull_image
+
+  plan_build
+
+  if [[ "${SKIP_BUILD}" -eq 1 && "${git_updated}" -eq 1 ]]; then
+    cmd_status
+    exit 0
+  fi
+
+  build_in_container
+  install_bins_and_libs
+}
+
+cmd_build() {
+  parse_args "$@"
+  resolve_build_profile "${CUDA_BUILD_PROFILE}"
+  run_pipeline
+  cmd_status
+}
+
+cmd_update() {
+  parse_args "$@"
+  resolve_build_profile "${CUDA_BUILD_PROFILE}"
+  run_pipeline
+  cmd_status
+  cat <<EOF
+
+Actualización completada.  source ~/.bashrc  →  llama-cli --list-devices
+EOF
+}
+
+cmd_rebuild() {
+  parse_args "$@"
+  resolve_build_profile "${CUDA_BUILD_PROFILE}"
+  CLEAN_BUILD=1
+  CMAKE_RECONFIGURE=1
+  rm -rf "${BUILD_DIR}"
+  run_pipeline
+  cmd_status
+}
+
+cmd_clean() {
+  rm -rf "${BUILD_DIR}"
+  rm -f "${LAST_BUILD_COMMIT_FILE}" "${LAST_CMAKE_HASH_FILE}"
+  log "Borrado build y estado de compilación"
+}
+
+cmd_uninstall() {
+  local purge=false
+  [[ "${1:-}" == "--purge" ]] && purge=true
+
+  pkill -f 'llama-server' 2>/dev/null || true
+  pkill -f 'llama-cli' 2>/dev/null || true
+
+  if ! rm -rf "${INSTALL_DIR}" "${LIB_DIR}" 2>/dev/null; then
+    warn "Binarios/libs con dueño distinto (build previo como root); intentando con sudo..."
+    sudo rm -rf "${INSTALL_DIR}" "${LIB_DIR}"
+  fi
+  remove_bashrc_block
+
+  if [[ "${purge}" == true ]]; then
+    rm -rf "${SRC_DIR}"
+    for tag in $(image_fallback_tags); do
+      podman rmi "docker.io/nvidia/cuda:${tag}-devel-${CUDA_OS}" 2>/dev/null || true
+    done
+    log "Purge completado"
+  else
+    log "Fuentes en ${SRC_DIR}"
+  fi
+}
+
+cmd_status() {
+  resolve_build_profile "${CUDA_BUILD_PROFILE}"
+  echo "CUDA / perfil:      ${EFFECTIVE_CUDA_TAG} / ${CUDA_BUILD_PROFILE}"
+  echo "Imagen:             $(image_name)"
+  echo "Git:                ${GIT_REMOTE}/${GIT_BRANCH}"
+  if [[ -d "${SRC_DIR}/.git" ]]; then
+    echo "Commit local:       $(git_short "$(git_local_commit)")"
+    if git_has_remote_branch; then
+      echo "Commit remoto:      $(git_short "$(git_remote_commit)")"
+      if [[ "$(git_local_commit)" != "$(git_remote_commit)" ]]; then
+        echo "Git:                ACTUALIZACIÓN DISPONIBLE"
+      else
+        echo "Git:                al día"
+      fi
+    fi
+    echo "Último build:       $(git_short "$(last_built_commit)")"
+  else
+    echo "Fuentes:            no clonadas"
+  fi
+  echo "CMake hash (cfg):   $(cmake_args_hash | cut -c1-12)… (guardado: $(last_cmake_hash | cut -c1-12)…)"
+  echo "Instalado:          $([[ -x "${INSTALL_DIR}/llama-cli" ]] && echo sí || echo no)"
+}
+
+cmd_env() {
+  cat <<EOF
+export PATH="${INSTALL_DIR}:\${PATH}"
+export LD_LIBRARY_PATH="${LIB_DIR}:\${LD_LIBRARY_PATH:-}"
+EOF
+}
+
+main() {
+  local cmd="${1:-build}"
+  shift || true
+  case "${cmd}" in
+    build)     cmd_build "$@" ;;
+    update)    cmd_update "$@" ;;
+    rebuild)   cmd_rebuild "$@" ;;
+    clean)     cmd_clean "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    status)    cmd_status "$@" ;;
+    pull)
+      resolve_build_profile "${CUDA_BUILD_PROFILE}"
+      ensure_podman
+      pull_image
+      ;;
+    env) cmd_env ;;
+    -h|--help|help) usage ;;
+    *) die "Comando desconocido: ${cmd}" ;;
+  esac
+}
+
+main "$@"

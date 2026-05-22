@@ -1,0 +1,29 @@
+# =============================================================================
+# config.example — copia a config:  cp config.example config
+# =============================================================================
+
+CUDA_IMAGE_TAG="13.2.0"
+# Perfil (imagen Podman / versión nvcc):
+#   toolkit-13.0  → CUDA 13.0.0 devel
+#   toolkit-12.8  → CUDA 12.8.0 devel
+#   stable        → CUDA_IMAGE_TAG + -Xcicc -O1 (IQ en CUDA 13.2+)
+#   latest        → CUDA_IMAGE_TAG sin workaround
+CUDA_BUILD_PROFILE="toolkit-13.0"
+CUDA_OS="ubuntu24.04"
+
+REPO_URL="https://github.com/ggml-org/llama.cpp.git"
+GIT_BRANCH="master"
+GIT_REMOTE="origin"
+
+# NVIDIA Blackwell (RTX 50xx): 120 — upstream puede promover a 120a para FP4
+CUDA_ARCH="120"
+
+GGML_CUDA_FA_ALL_QUANTS="ON"
+GGML_CUDA_GRAPHS="ON"
+GGML_NATIVE="ON"
+LLAMA_OPENSSL="ON"
+
+# Si GGML_NATIVE=OFF, descomenta:
+# CPU_NATIVE_FLAGS="-march=native"
+
+BASHRC_MARKER="# llama.cpp CUDA (llama-cuda-toolbox)"

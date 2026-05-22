@@ -1,0 +1,12 @@
+# Config local (copiar desde config.example)
+config
+
+# Estado / caché del host (no van al repo)
+.llama-cuda-*
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
