@@ -28,6 +28,7 @@ Comandos:
   update [--profile P]    Fetch git + recompila solo si hay commits o config nuevos
   rebuild [--profile P]   Limpia build/ y recompila todo
   uninstall [--purge]     Desinstala (purge = fuentes + imágenes)
+  rmi-images              Borra solo imágenes Podman nvidia/cuda (no binarios ni fuentes)
   clean                   Borra solo ${BUILD_DIR}
   status                  Estado, git, último commit compilado
   pull                    Descarga imagen Podman
@@ -91,12 +92,29 @@ parse_args() {
 
 image_name() { echo "docker.io/nvidia/cuda:${EFFECTIVE_CUDA_TAG}-devel-${CUDA_OS}"; }
 
+cuda_image_tags_all() {
+  echo "13.2.0 13.1.0 13.0.0 12.8.0"
+}
+
 image_fallback_tags() {
   case "${CUDA_BUILD_PROFILE}" in
     toolkit-13.0) echo "13.0.0" ;;
     toolkit-12.8) echo "12.8.0" ;;
-    *)            echo "13.2.0 13.1.0 13.0.0 12.8.0" ;;
+    *)            cuda_image_tags_all ;;
   esac
+}
+
+remove_cuda_images() {
+  local tag image removed=0
+  for tag in $(cuda_image_tags_all); do
+    image="docker.io/nvidia/cuda:${tag}-devel-${CUDA_OS}"
+    if podman image exists "${image}" >/dev/null 2>&1; then
+      podman rmi "${image}" >/dev/null && log "Eliminada: ${image}" && removed=1
+    fi
+  done
+  if [[ "${removed}" -eq 0 ]]; then
+    log "No había imágenes CUDA del toolbox (13.x / 12.8 devel-${CUDA_OS})"
+  fi
 }
 
 ensure_podman() {
@@ -513,6 +531,12 @@ cmd_clean() {
   log "Borrado build y estado de compilación"
 }
 
+cmd_rmi_images() {
+  ensure_podman
+  remove_cuda_images
+  log "Binarios y fuentes intactos; próximo build hará pull de nuevo"
+}
+
 cmd_uninstall() {
   local purge=false
   [[ "${1:-}" == "--purge" ]] && purge=true
@@ -528,9 +552,8 @@ cmd_uninstall() {
 
   if [[ "${purge}" == true ]]; then
     rm -rf "${SRC_DIR}"
-    for tag in $(image_fallback_tags); do
-      podman rmi "docker.io/nvidia/cuda:${tag}-devel-${CUDA_OS}" 2>/dev/null || true
-    done
+    ensure_podman
+    remove_cuda_images
     log "Purge completado"
   else
     log "Fuentes en ${SRC_DIR}"
@@ -574,8 +597,9 @@ main() {
     build)     cmd_build "$@" ;;
     update)    cmd_update "$@" ;;
     rebuild)   cmd_rebuild "$@" ;;
-    clean)     cmd_clean "$@" ;;
-    uninstall) cmd_uninstall "$@" ;;
+    clean)       cmd_clean "$@" ;;
+    rmi-images)  cmd_rmi_images "$@" ;;
+    uninstall)   cmd_uninstall "$@" ;;
     status)    cmd_status "$@" ;;
     pull)
       resolve_build_profile "${CUDA_BUILD_PROFILE}"

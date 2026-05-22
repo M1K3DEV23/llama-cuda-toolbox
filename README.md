@@ -73,6 +73,7 @@ El **perfil** elige la imagen Podman (versión de CUDA / nvcc), no solo flags CM
 ./llama-cuda rebuild --force    # reset git duro + rebuild
 ./llama-cuda status             # git, perfil CUDA, último build
 ./llama-cuda pull               # solo descarga imagen Podman
+./llama-cuda rmi-images         # borra imágenes nvidia/cuda (13.x, 12.8); no toca binarios ni fuentes
 ./llama-cuda env                # export PATH / LD_LIBRARY_PATH
 ./llama-cuda uninstall          # quita binarios y entradas en .bashrc
 ./llama-cuda uninstall --purge  # + fuentes ~/.cache/llama-cpp-src + imágenes
