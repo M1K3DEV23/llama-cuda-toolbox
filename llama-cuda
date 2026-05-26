@@ -427,12 +427,16 @@ install_bins_and_libs() {
   # CUDA toolkit + NCCL (ggml-cuda enlaza NCCL si GGML_CUDA_NCCL=ON en el build)
   podman run --rm --security-opt label=disable \
     -v "${LIB_DIR}:${LIB_DIR}:Z" \
+    -e LIB_DIR="${LIB_DIR}" \
     "$(image_name)" \
-    bash -c 'set -e
-      cp -a /usr/local/cuda/lib64/libcudart.so* /usr/local/cuda/lib64/libcublas.so* /usr/local/cuda/lib64/libcublasLt.so* '"${LIB_DIR}"'/ 2>/dev/null || true
-      if compgen -G /usr/lib/x86_64-linux-gnu/libnccl.so* >/dev/null; then
-        cp -a /usr/lib/x86_64-linux-gnu/libnccl.so* '"${LIB_DIR}"'/'
-      fi'
+    bash -euo pipefail -c "$(cat <<'COPYLIBS'
+set -e
+cp -a /usr/local/cuda/lib64/libcudart.so* /usr/local/cuda/lib64/libcublas.so* /usr/local/cuda/lib64/libcublasLt.so* "${LIB_DIR}/" 2>/dev/null || true
+if compgen -G /usr/lib/x86_64-linux-gnu/libnccl.so* >/dev/null; then
+  cp -a /usr/lib/x86_64-linux-gnu/libnccl.so* "${LIB_DIR}/"
+fi
+COPYLIBS
+)"
   if ! compgen -G "${LIB_DIR}/libnccl.so*" >/dev/null && ldd "${LIB_DIR}/libggml-cuda.so.0" 2>/dev/null | grep -q 'libnccl.so.*not found'; then
     warn "libnccl no copiada; llama-cli fallará hasta reinstalar libs"
   fi
@@ -461,11 +465,25 @@ EOF
 
 remove_bashrc_block() {
   [[ -f "${HOME}/.bashrc" ]] || return
-  for marker in "${BASHRC_MARKER}" "# llama.cpp CUDA (build-llama-cuda-podman.sh)"; do
-    if grep -qF "${marker}" "${HOME}/.bashrc" 2>/dev/null; then
-      sed -i "\|$(printf '%s' "${marker}" | sed 's/[][\\^$.|*+?(){}]/\\&/g')|,/+2d" "${HOME}/.bashrc" || true
-    fi
-  done
+  python3 - "${HOME}/.bashrc" <<PY
+import sys
+path = sys.argv[1]
+markers = [
+    """${BASHRC_MARKER}""",
+    "# llama.cpp CUDA (build-llama-cuda-podman.sh)",
+]
+with open(path, encoding="utf-8") as f:
+    lines = f.readlines()
+out, i = [], 0
+while i < len(lines):
+    if any(m in lines[i] for m in markers):
+        i += 3  # marcador + PATH + LD_LIBRARY_PATH
+        continue
+    out.append(lines[i])
+    i += 1
+with open(path, "w", encoding="utf-8") as f:
+    f.writelines(out)
+PY
 }
 
 run_pipeline() {
